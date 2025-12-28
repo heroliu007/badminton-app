@@ -2,91 +2,35 @@ import streamlit as st
 import pandas as pd
 import itertools
 import graphviz
-import gspread
-from google.oauth2 import service_account
+from io import BytesIO
 
 # =======================
-# 設定與 CSS 優化
+# 設定與 CSS
 # =======================
-st.set_page_config(page_title="雲端同步循環賽系統", layout="wide", page_icon="🏸")
+st.set_page_config(page_title="多場地循環賽系統", layout="wide", page_icon="🏆")
 
 st.markdown("""
 <style>
     .stDataFrame { margin: 0 auto; }
-    div[data-testid="stMetricValue"] { font-size: 1.5rem; }
     h3 { color: #2c3e50; }
-    .stButton button { width: 100%; border-radius: 5px; }
+    /* 讓 Tabs 字體大一點，方便手機點擊 */
+    button[data-baseweb="tab"] { font-size: 1.2rem; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 # =======================
-# 0. Google Sheets 連線設定
-# =======================
-
-@st.cache_resource
-def get_gsheet_connection():
-    """建立與 Google Sheets 的連線 (快取以避免重複連線)"""
-    try:
-        # 讀取 Secrets
-        key_dict = st.secrets["gcp_service_account"]
-        sheet_url = st.secrets["spreadsheets"]["sheet_url"]
-        
-        # 驗證
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = service_account.Credentials.from_service_account_info(key_dict, scopes=scope)
-        client = gspread.authorize(creds)
-        
-        # 開啟試算表
-        sheet = client.open_by_url(sheet_url)
-        worksheet = sheet.get_worksheet(0) # 讀取第一個工作表
-        return worksheet
-    except Exception as e:
-        st.error(f"連線失敗：{e}")
-        return None
-
-def load_data_from_sheet(worksheet):
-    """從試算表讀取資料轉為 DataFrame"""
-    try:
-        data = worksheet.get_all_records()
-        if not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        # 確保得分欄位是數字，處理空字串
-        cols = ["A 得分", "B 得分"]
-        for col in cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df
-    except Exception as e:
-        st.warning("試算表可能是空的或格式有誤，將建立新賽程。")
-        return pd.DataFrame()
-
-def save_data_to_sheet(worksheet, df):
-    """將 DataFrame 寫回試算表"""
-    try:
-        # 將 NaN 轉為 None (JSON 寫入時需要) 或空字串
-        df_save = df.copy()
-        df_save = df_save.fillna("")
-        
-        # 1. 清空舊資料
-        worksheet.clear()
-        
-        # 2. 寫入標題與內容
-        # update 方法需要 list of lists
-        data_to_write = [df_save.columns.values.tolist()] + df_save.values.tolist()
-        worksheet.update(data_to_write)
-        st.toast("✅ 資料已成功同步至 Google Sheets！", icon="☁️")
-    except Exception as e:
-        st.error(f"寫入失敗：{e}")
-
-# =======================
-# 1. 核心邏輯區
+# 核心邏輯函數
 # =======================
 
 def generate_schedule(players):
-    """產生單循環賽程的初始資料結構"""
+    """產生初始賽程"""
     matches = []
-    # 確保不會自己打自己，且不重複
-    for p1, p2 in itertools.combinations(players, 2):
+    # 移除空白行並去重
+    clean_players = list(set([p.strip() for p in players if p.strip()]))
+    if len(clean_players) < 2:
+        return pd.DataFrame()
+        
+    for p1, p2 in itertools.combinations(clean_players, 2):
         matches.append({
             "隊伍 A": p1,
             "隊伍 B": p2,
@@ -95,8 +39,10 @@ def generate_schedule(players):
         })
     return pd.DataFrame(matches)
 
-def calculate_rankings(df_matches, players):
-    """計算積分與排名"""
+def calculate_rankings(df_matches):
+    """計算積分"""
+    # 取得所有隊伍名單
+    players = list(set(df_matches["隊伍 A"]).union(set(df_matches["隊伍 B"])))
     stats = {p: {"勝": 0, "敗": 0, "得失分": 0, "總得分": 0} for p in players}
     
     for index, row in df_matches.iterrows():
@@ -105,7 +51,7 @@ def calculate_rankings(df_matches, players):
         s1 = row["A 得分"]
         s2 = row["B 得分"]
         
-        if pd.notna(s1) and pd.notna(s2) and s1 != "" and s2 != "":
+        if pd.notna(s1) and pd.notna(s2):
             stats[p1]["總得分"] += s1
             stats[p2]["總得分"] += s2
             stats[p1]["得失分"] += (s1 - s2)
@@ -126,28 +72,17 @@ def calculate_rankings(df_matches, players):
     df_rank.index += 1 
     return df_rank
 
-def create_cross_table(df_matches, players):
-    """產生交叉勝敗表"""
-    cross_df = pd.DataFrame("-", index=players, columns=players)
-    for p in players: cross_df.at[p, p] = "❌"
-
-    for index, row in df_matches.iterrows():
-        p1 = row["隊伍 A"]
-        p2 = row["隊伍 B"]
-        s1 = row["A 得分"]
-        s2 = row["B 得分"]
-        
-        if pd.notna(s1) and pd.notna(s2) and s1 != "" and s2 != "":
-            cross_df.at[p1, p2] = f"{int(s1)}:{int(s2)}"
-            cross_df.at[p2, p1] = f"{int(s2)}:{int(s1)}"
-    return cross_df
-
 def draw_network(df_matches):
-    """繪製勝敗關係圖"""
+    """繪製關係圖"""
     graph = graphviz.Digraph()
     graph.attr(rankdir='LR', layout='circo')
     graph.attr('node', shape='ellipse', style='filled', color='lightblue')
     
+    # 確保所有隊伍都有節點
+    players = list(set(df_matches["隊伍 A"]).union(set(df_matches["隊伍 B"])))
+    for p in players:
+        graph.node(p)
+
     has_result = False
     for index, row in df_matches.iterrows():
         p1 = row["隊伍 A"]
@@ -155,10 +90,7 @@ def draw_network(df_matches):
         s1 = row["A 得分"]
         s2 = row["B 得分"]
         
-        graph.node(p1)
-        graph.node(p2)
-
-        if pd.notna(s1) and pd.notna(s2) and s1 != "" and s2 != "":
+        if pd.notna(s1) and pd.notna(s2):
             has_result = True
             if s1 > s2:
                 graph.edge(p1, p2, label=f"{int(s1)}:{int(s2)}", color='green')
@@ -166,113 +98,123 @@ def draw_network(df_matches):
                 graph.edge(p2, p1, label=f"{int(s2)}:{int(s1)}", color='green')
     
     if not has_result:
-        graph.attr(label='(輸入比分並儲存後，箭頭會出現)')
-        
+        graph.attr(label='(比賽開始後顯示勝敗走向)')
     return graph
 
+def convert_df_to_csv(df):
+    """將 DataFrame 轉為 CSV 下載用"""
+    return df.to_csv(index=False).encode('utf-8-sig')
+
 # =======================
-# 2. 網頁介面區 (UI)
+# 單一賽程管理介面 (封裝成函數以重複使用)
 # =======================
 
-st.title("🏸 雲端循環賽系統 (Google Sheets)")
-
-# 初始化連線
-worksheet = get_gsheet_connection()
-
-# --- 側邊欄 ---
-with st.sidebar:
-    st.header("⚙️ 設定")
+def render_tournament_group(group_name):
+    """渲染單一組別的完整介面"""
+    st.header(f"🏟️ {group_name} 賽程管理")
     
-    # 這裡的邏輯：如果 Sheet 是空的，顯示預設名單；如果有資料，從資料中提取名單
-    st.info("💡 系統會優先讀取 Google Sheet 的資料。若要重新開始，請按下方重置按鈕。")
+    # Session State Key 的唯一識別碼 (避免 A 組跟 B 組資料打架)
+    ss_key = f"df_{group_name}"
     
-    default_players_text = "張三/李四\n王五/趙六\nTeam A\nTeam B\nTeam C"
-    raw_text = st.text_area("參賽名單 (用於重置賽程)", default_players_text, height=150)
-    input_players_list = [p.strip() for p in raw_text.split('\n') if p.strip()]
+    # 1. 初始化資料
+    if ss_key not in st.session_state:
+        st.session_state[ss_key] = pd.DataFrame()
 
-    if st.button("🚨 重置並覆蓋 Sheet"):
-        confirm_reset = True 
-        # 實際重置邏輯
-        new_df = generate_schedule(input_players_list)
-        save_data_to_sheet(worksheet, new_df)
-        st.session_state["local_df"] = new_df
-        st.rerun()
-
-# --- 資料載入邏輯 ---
-# 每次畫面刷新，我們優先檢查 session state，如果沒有才去讀 Sheet
-if "local_df" not in st.session_state:
-    with st.spinner('正在從 Google Sheets 讀取資料...'):
-        df_cloud = load_data_from_sheet(worksheet)
+    # 2. 設定區域 (側邊欄縮進去太擠，改用 Expander)
+    with st.expander(f"⚙️ {group_name} 設定 (名單/上傳)", expanded=False):
+        col_input, col_upload = st.columns(2)
         
-    if df_cloud.empty:
-        # 如果雲端是空的，就用側邊欄名單建立新的
-        st.session_state["local_df"] = generate_schedule(input_players_list)
-    else:
-        st.session_state["local_df"] = df_cloud
+        with col_input:
+            default_text = "隊伍1\n隊伍2\n隊伍3"
+            raw_text = st.text_area(f"{group_name} 參賽名單 (一行一隊)", default_text, height=100, key=f"text_{group_name}")
+            if st.button(f"✨ 產生 {group_name} 新賽程", key=f"btn_gen_{group_name}"):
+                players = raw_text.split('\n')
+                st.session_state[ss_key] = generate_schedule(players)
+                st.rerun()
 
-# 確保我們有目前的參賽者名單 (從 DataFrame 提取，以防雲端資料跟側邊欄不一致)
-current_df = st.session_state["local_df"]
-if not current_df.empty:
-    players_in_data = list(set(current_df["隊伍 A"]).union(set(current_df["隊伍 B"])))
-else:
-    players_in_data = input_players_list
+        with col_upload:
+            uploaded_file = st.file_uploader(f"或是上傳 Excel/CSV ({group_name})", type=['xlsx', 'csv'], key=f"up_{group_name}")
+            if uploaded_file is not None:
+                try:
+                    if uploaded_file.name.endswith('.csv'):
+                        df_upload = pd.read_csv(uploaded_file)
+                    else:
+                        df_upload = pd.read_excel(uploaded_file)
+                    
+                    # 簡單檢查欄位
+                    required_cols = {"隊伍 A", "隊伍 B"}
+                    if required_cols.issubset(df_upload.columns):
+                        st.session_state[ss_key] = df_upload
+                        st.success("✅ 匯入成功！")
+                    else:
+                        st.error("❌ 格式錯誤！請包含：'隊伍 A', '隊伍 B'")
+                except Exception as e:
+                    st.error(f"讀取失敗: {e}")
 
-# --- 主畫面 ---
-if len(players_in_data) < 2:
-    st.error("目前無賽程資料，請檢查名單或雲端連線。")
-else:
-    # 第一區：輸入
-    st.subheader("1️⃣ 輸入比分")
+    # 3. 取得目前資料
+    df = st.session_state[ss_key]
+
+    if df.empty:
+        st.info("👈 請先在設定區輸入名單或上傳檔案")
+        return
+
+    # 4. 比分輸入區 (Data Editor)
+    st.subheader("📝 輸入比分")
+    edited_df = st.data_editor(
+        df,
+        column_config={
+            "A 得分": st.column_config.NumberColumn(min_value=0, max_value=200),
+            "B 得分": st.column_config.NumberColumn(min_value=0, max_value=200),
+        },
+        hide_index=True,
+        use_container_width=True,
+        num_rows="dynamic", # 允許新增刪除行
+        key=f"editor_{group_name}"
+    )
     
-    col_edit, col_save = st.columns([4, 1])
-    
-    with col_edit:
-        edited_df = st.data_editor(
-            st.session_state["local_df"],
-            column_config={
-                "A 得分": st.column_config.NumberColumn(min_value=0, max_value=100),
-                "B 得分": st.column_config.NumberColumn(min_value=0, max_value=100),
-            },
-            hide_index=True,
-            use_container_width=True,
-            num_rows="fixed",
-            key="data_editor_key" 
-        )
+    # ⚠️ 重要：手動更新 session state，確保切換 Tab 時資料還在
+    # Streamlit 的 data_editor 自動會更新 key 對應的 state，但為了保險起見或做額外處理，有時需手動
+    # 但在此例中，data_editor 的 key 機制已經足夠維持編輯狀態
 
-    with col_save:
-        st.write(" ") # 排版用
-        st.write(" ")
-        # 儲存按鈕
-        if st.button("💾 上傳雲端", type="primary"):
-            save_data_to_sheet(worksheet, edited_df)
-            st.session_state["local_df"] = edited_df # 更新本地狀態
+    # 5. 安全備份下載 (因為沒有連雲端資料庫)
+    csv = convert_df_to_csv(edited_df)
+    st.download_button(
+        label=f"💾 下載 {group_name} 賽程與比分備份 (CSV)",
+        data=csv,
+        file_name=f'{group_name}_schedule.csv',
+        mime='text/csv',
+        key=f"dl_{group_name}"
+    )
 
-    # 計算資料
-    rank_df = calculate_rankings(edited_df, players_in_data)
-    cross_df = create_cross_table(edited_df, players_in_data)
-
-    # 第二區：表格與圖表
-    st.divider()
-    
-    tab1, tab2, tab3 = st.tabs(["📊 排名與統計圖", "🕸️ 勝敗關係圖", "🔢 交叉勝敗表"])
-
-    with tab1:
-        col_rank, col_chart = st.columns([1, 1.5])
-        with col_rank:
-            st.markdown("#### 目前排名")
+    # 6. 統計與圖表
+    if not edited_df.empty:
+        rank_df = calculate_rankings(edited_df)
+        
+        t1, t2 = st.tabs(["📊 排名", "🕸️ 關係圖"])
+        
+        with t1:
             st.dataframe(rank_df.style.highlight_max(axis=0, color="#d1e7dd"), use_container_width=True)
-        with col_chart:
-            st.markdown("#### 得失分統計")
-            st.bar_chart(rank_df.set_index("隊伍")["得失分"], color="#3498db")
+        with t2:
+            try:
+                st.graphviz_chart(draw_network(edited_df))
+            except:
+                st.write("圖表繪製中...")
 
-    with tab2:
-        st.markdown("#### 🔄 對戰食物鏈")
-        st.caption("箭頭表示：贏家 -> 輸家")
-        try:
-            st.graphviz_chart(draw_network(edited_df))
-        except Exception:
-            st.warning("圖表產生中...")
+# =======================
+# 主程式入口
+# =======================
 
-    with tab3:
-        st.markdown("#### ❌ 傳統交叉表")
-        st.dataframe(cross_df, use_container_width=True)
+st.title("🏆 多場地循環賽系統 (手機暫存版)")
+st.caption("⚠️ 注意：本模式資料暫存於瀏覽器，**重新整理或關閉網頁會導致資料遺失**，請善用「下載備份」按鈕。")
+
+# 建立四個主分頁
+tab_a, tab_b, tab_c, tab_d = st.tabs(["🅰️ 第一場地", "🅱️ 第二場地", "©️ 第三場地", "🇩 第四場地"])
+
+with tab_a:
+    render_tournament_group("Group_A")
+with tab_b:
+    render_tournament_group("Group_B")
+with tab_c:
+    render_tournament_group("Group_C")
+with tab_d:
+    render_tournament_group("Group_D")
